@@ -1,0 +1,559 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage[nottoc]{tocbibind}
+
+\usepackage{multirow}
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+\newcommand{\hmark}{\ding{119}}
+
+\theoremstyle{definition}
+\newtheorem{example}{Example}
+
+\title{History and state of Monero security analysis}
+\author{Cypher Stack\thanks{\url{https://cypherstack.com}} \and B.G. Goodell}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+Monero is a distributed digital asset whose protocol and implementations are intended to use cryptographic and other techniques to improve privacy and safety.
+Years of analysis on Monero and other digital asset protocols and implementations have uncovered a variety of techniques that an adversary might use to degrade these properties.
+This technical note provides an overview of the history of such analysis.
+Many, but not all, of those methods have since been at least partially mitigated through protocol or implementation changes.
+While some methods were theoretical or otherwise not particularly effective, other concerning attack and analysis surfaces remain.
+As the Monero community is discussing new protocol research that fundamentally improves the nature of its privacy goals, focus is particularly given to the impacts of such changes on previous analysis.
+
+
+\tableofcontents
+
+
+\section{Introduction}
+
+Monero is a distributed digital asset protocol and project focused on safety and privacy of transactions.
+Transactions in Monero protect data and metadata like sender, recipient, and amount using different cryptographic and other techniques.
+
+Value in Monero, like in other digital asset protocols, is represented by \textit{outputs} that cryptographically contain representations of amount, spend authority, and other associated data.
+A transaction consumes one or more existing outputs, and generates new outputs.
+
+Each consumed output comes equipped with a \textit{ring signature} that both authorizes its consumption in the transaction, as well as proves that the authorizing output is an element of a small ad-hoc, sender-selected \textit{ring}, or \textit{anonymity set} of possible outputs.
+By not revealing which member of the anonymity set authorized the consumption, ring signatures provide a degree of ambiguity as to which outputs a transaction consumes.
+An output generated in a transaction encodes its spend authority using a non-interactive one-time derivation that dissociates the spend authority from the wallet address of the recipient.
+Each such output has its amount protected using a Pedersen commitment and associated range proof, and can further encrypt a short arbitrary payment identifier to the recipient for bookkeeping purposes.
+
+Digital asset protocols have an associated \textit{transaction graph} that maps consumed outputs to generated outputs via transactions.
+In protocols like Bitcoin, this graph is public; any observer can trivially see the outputs consumed and generated in any transaction.
+By contrast, protocols like Monero induce an ambiguous graph; while the outputs generated in a transaction are definitively known and observable (but not associated metadata like recipient addresses or amounts), each consumed output has a set of candidates.
+
+This graph ambiguity property, as other properties like amount hiding and one-time non-interactive recipient addressing, was relatively unique early in the project's history.
+Like many other aspects of the protocol, it has evolved over time.
+This is primarily in response to a growing field of analysis that, in part, aims to remove the ambiguity from the transaction graph.
+
+Such identification would reveal the underlying ``true'' transaction graph associated to a transaction, but not necessarily more real-world information about entities affiliated with a transaction.
+However, transactions do not magically appear as elements of blocks on the Monero blockchain.
+After generation, they are propagated through the network to miners, who validate them prior to inclusion in a block.
+Another class of attacks seeks to identify the network source of transactions, which can provide useful data to an adversary.
+
+In this technical note, we examine attacks and methods of analysis including these.
+While some have been mitigated through updates to the Monero protocol and popular implementations, others remain prevalent and can be effective given particular threat models.
+
+However, all is not lost.
+Ongoing protocol research seeks to replace ring signatures with \textit{full-chain membership proofs} (FCMPs) in transactions.
+These proofs effectively increase the degree of ambiguity for consumed outputs maximally: absent external information, any given transaction might consume any previously-generated output.
+As discussed later, this technique effectively renders a large class of analysis moot.
+
+
+\subsection{Overview}
+
+The degree to which privacy is a practical concern for Monero users remains an open question.
+\textit{Round-trip economic activity} with KYC/AML exchanges is likely inevitable for most users, and leads naturally to the \textit{EAE attack}.
+\textit{Flooding}, an attack driven by ensuring ownership of many transaction outputs during limited time intervals, is inexpensive and can massively degrade anonymity set sizes.
+\textit{Churning}, engaging in one or more transactions to oneself, is the folklore heuristic approach to mitigate EAE, and may also mitigate the severity of a flood attack, but lacks formal analysis and leads to blockchain bloat.
+With these and other methods in mind, we present a broad historical overview of the state of knowledge of privacy in Monero, with an eye toward developing a better understanding of practices.
+
+
+\subsection{Some good practices}
+
+The following are some identifiable best practices, based upon the general principles \textit{design your transactions to not stand out in a crowd} and \textit{trust no one, because their sloppy practices impact your own security}.
+This principle applies broadly to economic behaviors, participation on the network, and many attack and analysis vectors that we examine.
+\begin{itemize}
+\item Use default Monero client and wallet software, and use Tor or another overlay network if possible.
+\item Assume all unknown remote nodes are malicious, including web wallets.
+\item Wait unpredictable periods of time, sampled from the temporal distribution in the default Monero wallet, in between transactions.
+\item Make most transactions $1$- or $2$-in, $2$-out, matching most transactions that exclude mining pool payouts, exchange operations, sweeps, and other larger-scale economic movements.
+\item Avoid assumptions about your adversary's heuristics; there are many that can intersect and overlap, and avoiding particular methods may itself introduce distinguishable patterns.
+\end{itemize}
+
+We discuss areas for recommended future research in \ref{sec:future}.
+
+
+\section{Historical overview}
+
+We now present an overview of methods of analysis and attack on Monero's untraceability properties.
+
+\subsection{Methods}
+
+
+\subsubsection{Chain reaction, flooding, closed sets, and output merging}
+
+An early class of analysis against CryptoNote-style transaction protocols, known at least since \cite{noether2014note}, relies primarily on the use of smaller rings with certain types of activity.
+
+In a \textit{chain reaction} analysis, known spent outputs are iteratively removed from consideration in other transactions' rings, reducing effective spend ambiguity.
+As the Monero protocol originally allowed for a trivial ring (or effectively any size), this analysis was initially effective and depended heavily on the distribution of ring sizes.
+Further, an adversary who \textit{floods} or ``poisons'' the chain with its own outputs can privately perform such an analysis, since it knows which outputs it controls and spends in transactions.
+This approach was also investigated in \cite{kumar2017traceability}, \cite{moser2017empirical}, \cite{miller2017empirical}, \cite{christensen2018comparative}, \cite{hinteregger2018monero}, and \cite{wijaya2018monero}, among other work, and we discuss it at some length in Section \ref{subsubsec:adversarial_floods}.
+Results indicate that while adversarial poisoning can be effective, such effectiveness decreases with increased ring size; further, protocol-enforced ring sizes render the likelihood of non-adversarial chain reactions moot.
+
+In a \textit{closed set} analysis, the use of simple set theory can determine sets of transactions where a union of constituent ring members may be deterministically marked as spent.
+This can occur by chance or through a deliberate selection of ring members used to create such transaction sets.
+Such analysis was performed in \cite{noether2018note}, \cite{hinteregger2018monero}, and \cite{yu2019new}, finding that the chance occurrence of closed sets is vanishingly small for current ring sizes, but that an adversarial closed set construction is always possible.
+
+Further, work in \cite{kedziora2020practical}, \cite{hinteregger2018monero}, and \cite{ye2020alt} indicates that countermeasures against closet-set and chain reaction analysis implemented by Monero contributors since \cite{noether2014note} have mostly proven effective against the original analyses of \cite{moser2017empirical} and \cite{kumar2017traceability} except for certain rare edge cases and intentional testing.
+
+\textit{Output merging} refers to the analysis of transactions that consume multiple outputs originating from the same transaction.
+The technique is based on the following idea.
+Let $X$ and $Y$ be two outputs which were created in a common transaction $T$ (which is old enough to have been confirmed).
+In the course of creating a new random transaction by a new random user, sampling both $X$ and $Y$ as ring members for two distinct rings is extremely unlikely.
+On the other hand, if the owner of $X$ and $Y$ spends them in a single transaction, it is certain $X$ and $Y$ both appear as ring members.
+Observing this allows attackers to probabilistically conclude $X$ and $Y$ have been spent.
+
+This is investigated in \cite{kumar2017traceability} using deterministic chain reaction analysis as ground truth, concluding effectiveness where the true positive rate decreases with increased ring size, primarily due to the lack of ground truth results.
+It is further analyzed in \cite{christensen2018comparative} and \cite{hinteregger2018monero} as well, finding similarly decreasing true positives over time as ring sizes increase.
+
+
+\subsubsection{Temporal ring distribution}
+
+A class of heuristics takes advantage of distribution differences between expected spend patterns and the sampling of ring members used in transactions.
+\cite{kumar2017traceability} includes such analysis, which uses the fact that wallet software at the time was very likely to sample decoy ring members older than the true spend.
+This leads immediately to a heuristic that identifies the most recent ring member as the true spend.
+
+The paper \cite{miller2017empirical} appears to be an early draft of \cite{moser2017empirical}; we intentionally confuse these two references in the following, generally taking information from \cite{moser2017empirical} whenever information conflicts.
+Miller, Moser \textit{et al.} deepened the analysis of \cite{kumar2017traceability} with more up-to-date data, and performed a more thorough analysis of the third heuristic, essentially using the gap between some ``ground truth'' spend-time distribution and some observations as a signal for linking transactions.
+Moreover, \cite{moser2017empirical} is one of the first papers employing different data trends at different points of history to partition the outputs on the Monero blockchain to impose structure to the unspent transaction output set of Monero.
+This leads \cite{moser2017empirical} to suggest fitting wallet sampling distributions and binning ring member selection as mitigations.
+
+Further, \cite{moser2017empirical} is also the first paper to suggest fitting wallet sample distributions to empirical observations of spend-time distributions.
+The true Monero spend-time distribution is not possible to directly measure without de-anonymizing the Monero blockchain, but a substantial portion of the Monero blockchain was deterministically traceable at the time of the publication.
+To account for this, \cite{moser2017empirical} instead used Bitcoin data and data from the deterministically traceable transactions as proxies to make estimates of ground truths.
+Using Monero's wallet sampling procedures at the time, \cite{moser2017empirical} showed via simulation that up to $80\%$ of new transactions would have older decoy ring members than the true ring member, and that their approach was $87\%$ accurate.
+
+Just as there is no way to measure the true spend-time distribution of the Monero economy, so \cite{moser2017empirical} understandably makes no attempt at assessing the full confusion matrix for their approach, although they do use certain proxy data to estimate the goodness of their approach.
+Their estimates are only for their simulations, under the typical assumptions used when deploying proxy data.
+
+Work in \cite{hinteregger2018monero} further indicates that distribution changes to the default Monero client software render the heuristic effectively unreliable for analysis.
+
+\cite{ronge2021foundations} constructs a tool for automatically comparing the goodness of using certain ring sampling distributions as the wallet distribution, while users are immersed in an economy with another true spend-time distribution.
+
+Similar work in \cite{christensen2018comparative} suggests a more complex approach to ring sampling that effectively partitions a ring using multiple sampling techniques.
+
+
+\subsubsection{Amount and fee linking}
+
+While the Monero protocol protects output amounts using Pedersen commitments, fees are necessarily visible.
+This ensures that arbitrary miners can receive these fees when producing blocks, as well as allow for the establishment of fee markets where users can effectively set transaction priority during times of high transaction load.
+
+Further, amount protection necessarily does not apply to recipients, who can decrypt output amounts and assert that Pedersen commitments are constructed validly in order to later spend the corresponding funds.
+It also does not apply to coinbase transactions that programmatically add new value into the system, where the network must check that claimed amounts are valid according to a specified emission schedule.
+
+Little work, either formal or informal, appears to exist examining the effects of these disclosures to Monero users.
+However, research applicable to other protocols may be useful as a proxy if considered carefully.
+
+For example, Zcash's transaction protocols have associated ``shielded pools'' where output data and metadata is protected.
+Transactions within these pools retain a high degree of spend ambiguity, as noted in work like \cite{wicht2023transaction}.
+However, transactions can also move value into and out of shielded pools, interacting with a transparent layer that functions very similarly to Bitcoin.
+Initial work by Quesnelle in \cite{quesnelle2017linkabilityzcashtransactions} examined so-called ``round-trip'' transaction sequences that transfer value from the transparent layer, into (and within) a shielded pool, and then back to the transparent layer.
+This analysis, and subsequent improvements in \cite{kappos2018empirical}, generally use the heuristic that such sequences may be identified by comparing transparent amounts.
+If a transaction of a given public value transfers funds from the transparent layer into a shielded pool, and a later transaction of transfers funds from the shielded pool into the transparent layer, the two can be linked if the amounts correspond (possibly accounting for fees).
+The heuristic is shown to identify a substantial fraction of such Zcash transactions uniquely, noting that the heuristic is not deterministic or without false positives due to chance.
+
+While this technique does not directly apply to Monero, its approach may still apply.
+Entities like exchanges, where customers may both withdraw and deposit funds over time, have visibility into transaction amounts that mirrors the Zcash transparent layer.
+Such entities could perform a similar analysis, using known amount data on withdrawals and deposits to examine chains of transactions where they do not have visibility into intermediate steps aside from public visibility into ring membership and fees.
+While there is no known work specifically investigating this in the case of Monero, such analysis is possible.
+
+
+\subsubsection{Reusing randomness}
+
+The paper \cite{courtois2017stealth} discusses the general security of stealth address techniques used at the time, introduces a randomness reuse attack against those techniques, recommends a new stealth address technique, and presents a proof sketch of scheme security under the One-More Discrete Logarithm hardness assumption.
+
+Risks associated to reuse of randomness, or reduced entropy in general for nonces and keys, are not specific to Monero.
+The default Monero client software is not known to be susceptible to such attacks; however, the use of malicious or malfunctioning wallet software could certainly introduce such risk.
+
+
+\subsubsection{Payment IDs}
+
+Monero transactions can optionally include an encrypted payment ID intended to be decrypted by the recipient of a generated output.
+The protocol is flexible on requirements for payment IDs, relying heavily on wallet software for consistency.
+Few papers, like \cite{wijaya2019anonymity}, claim heuristics against payment IDs.
+However, informal folklore considers that as a primary use for payment IDs is for exchanges and retailers, this optionality can provide a vector for fingerprinting.
+
+The default Monero client software can encrypt an empty payment ID when not requested, in order to reduce distinguishability.
+
+
+\subsubsection{Mining data}
+
+Blocks are produced by miners, who claim a block reward including fees and newly-minted Monero via coinbase outputs.
+Miners can participate in the network either alone or as part of a mining pool.
+In a pool scenario, the miner receives a fraction of the block reward for any block mined by the pool that is proportionate to the miner's computational effort.
+Pools then typically pay out their miners in subsequent transactions.
+It is common for mining pools to publish information on their mined blocks and payouts for transparency.
+
+Similarly to analyses of payment IDs, little formal work exists to investigate the on-chain effects of mining pool payout behavior; the paper \cite{wijaya2021transparency} claims analysis, some deterministic.
+Work in \cite{moser2017empirical} provides statistical data on pool activity using ground-truth data and heuristics.
+
+In addition to the analysis specific to mining pools, folklore suggests that because coinbase outputs are consumed in transactions only by miners, their presence in rings sampled for transactions by other users presents an unnecessary heuristic for exclusion; this heuristic holds even without public pool data.
+A proposed mitigation, requiring that coinbase outputs be segregated such that they only appear in rings consisting exclusively of coinbase outputs, does not appear to be used in common client software.
+
+
+\subsubsection{Network propagation}
+
+Monero transactions are propagated through its network to miners, who include them in blocks that are subsequently propagated to nodes and client software to be used.
+While block propagation by miners does not inherently leak data about transaction sources, transaction propagation may.
+That is, an adversary who can identify (either heuristically or deterministically) the network source of transactions gains an advantage in linking transactions, or in learning additional information about users.
+
+Diffusion of transaction data through a distributed ledger network is not unique to Monero.
+Influential work in \cite{bojja2017dandelion} on the Bitcoin network notes that symmetric transaction diffusion is subject to analysis by spy nodes that can link a significant fraction of Bitcoin public keys to network locations; it proposes Dandelion, a propagation approach that delays diffusion until after a randomized ``stem'' phase.
+Limitations on the assumptions of Dandelion led to the improved Dandelion++ in \cite{fanti2018dandelion++}, which changes node connectivity.
+Monero currently uses a modification of Dandelion++ that is intended to be compatible with overlay networks like Tor.
+
+However, the more recent preprint \cite{sharma2022anonymitypeertopeernetworkanonymity} finds that effectiveness is reduced for Dandelion-type designs using an entropic metric, but does not eliminate their benefit.
+
+Propagation analysis efficacy depends on the network location and connectivity of the broadcasting node, which may not be collocated with the user due to the use of remote nodes.
+Remote nodes, to which the user connects in order to submit transactions, necessarily learn connectivity information about the user.
+
+
+\subsubsection{Forced faults}
+
+\cite{wijaya2019risk} demonstrates an attack where asynchronous updating on nodes across the network can lead to a chain reorganization and certain faults.
+Generally, forcing reorganizations and faults is an easily-exploited path towards gaining information about user secrets.
+A naive example is a case where a user experiences a fault in the midst of broadcasting a one-time signature, and so broadcasts a different new one-time signature from the same key, accidentally revealing the key common to the two signatures.
+
+These attacks should inform protocol-level choices like mandatory lock times, as they can apply to transactions in multiple ways that may be difficult to otherwise mitigate.
+
+
+\subsubsection{Adversarial floods}\label{subsubsec:adversarial_floods}
+
+Adversarial floods are hinted at in \cite{noether2014note}, \cite{kumar2017traceability}, \cite{miller2017empirical}, and \cite{moser2017empirical}, and were more formally described in \cite{chervinski2019floodxmr}.
+A flood attack is based on the following observation: if an eavesdropper Eve sees a transaction $T$ she did not make using a ring member $X$ she owns, she knows certainly that $X$ was not truly spent in $T$.
+If Eve is honest-but-curious and owns many outputs which are used in many rings, she can deterministically reduce the effective anonymity set sizes substantially this way, tracing many (but generally not all) transactions.
+Eve is called a passive flood attacker if she is simply a Monero user who happens to own a high proportion of outputs per block, and someone already paid fees for creating these outputs.
+Eve is called an active flood attacker if she intentionally creates many outputs, on the other hand, and pays transaction fees to do so, leading to the name of the attack.
+
+Such an attack was proposed in \cite{chervinski2019floodxmr}, based upon the flooding-based attacks described in \cite{noether2014note}, \cite{kumar2017traceability}, \cite{miller2017empirical}, and \cite{moser2017empirical}, but with an adversary augmented with the ability to create ``spy nodes'' on the network.
+Depending on ring sampling and attacker resources, such flooding can be effective over different time periods.
+We note that the specific methodology of \cite{chervinski2019floodxmr} is flawed, in that it conducted simulations using incorrect protocol assumptions relating to fee structure and range proofs; however, the general methodology applies.
+Other later works, such as \cite{chervinski2021analysis}, look at transaction flooding attacks in both ``low-profile'' and ``strong'' attack regimes.
+Overall, transaction flooding attacks are a concern for limited-anonymity-set cryptocurrencies like Monero that rely on ring sampling and implicit assumptions of non-colluding output generators.
+The flood attack is of particular concern when attackers decides to target a specific user with predictable habits, because the attacker can focus her flood during a period of time which is likely to be sampled when Alice next selects a ring member.
+
+The flood attack makes both deterministic traceability problems like \textit{closed set} and \textit{chain reaction} attacks more effective.
+The flood attack also improves the performance of probabilistic traceability attacks.
+Any small-anonymity-set transaction protocol is vulnerable to the flood attack.
+It even appears that a flood attack may have already occurred in Bytecoin, the first CryptoNote-basedc protocol.
+Bytecoin was revealed to have several years of simulated blockchain data (see \cite{bytecoinbad}, \cite{bytecoinbad2}), essentially providing the creators both a secretive pre-mine, and a nearly fully transparent peek into chains of ByteCoin custody.
+
+
+\subsubsection{Cross-chain tracing}
+
+The privacy-respecting properties of protocols like Monero can be affected by behavior on related and other ledgers through \textit{cross-chain tracing} analysis.
+
+Monero chain forks can occur naturally, since multiple miners may produce blocks within a close time frame; these typically resolve quickly thanks to protocol rules dictating node fork selection.
+They can also occur intentionally, such as when a new project establishes a chain fork (with a corresponding forked codebase) to effectively produce a new asset.
+This was investigated in detail in \cite{hinteregger2018monero} and the related work \cite{hinteregger2019short}.
+When Monero V and Monero Original (among other projects) forked from Monero, users could spend Monero outputs on the forked blockchains, essentially gaining new transaction outputs for the new assets.
+However, spending these keys on more than one blockchain requires publishing more than one ring signature, introducing significant security threats.
+Such spends on multiple chains can be linked due to the presence of a common key image; the true spend for each transaction must exist in the intersection of the corresponding rings.
+Aside from this linking, the deterministic identification of these spent outputs allows a type of chain reaction analysis that removes them from consideration in other rings.
+
+Both \cite{hinteregger2018monero} and \cite{hinteregger2019short} indicate nontrivial but low overall impact from analyzed forks, but caution that more popular forks could still pose increased risk for users who conduct such cross-chain spends.
+They also note that client software mitigations, which include tools to use overlapping rings and exclude known-spent outputs, appear to have seen little use, despite their effectiveness.
+Other mitigations are proposed in \cite{wijaya2019unforkability}.
+
+Another way cross-chain traceability may be effected is when transparent-chain behavior can be linked to Monero blockchain behavior.
+For example, consider the scenario where a KYC/AML exchange Eve facilitates exchanges between the transparent Bitcoin chain and the obscured Monero chain.
+Eve not only can transparently watch her customers' Bitcoin activity, she can deterministically associate Bitcoin activity with immediate Monero activity, and then statistically associate this with future Monero activity.
+She can use information she knows about customer Bitcoin activity to infer information about customer Monero activity.
+
+The masterthesis \cite{evenepoel2022tracing} employs practical traceability against Monero transactions linked to Monero-based ransomware, leveraging transparent Bitcoin data.
+Additional work in \cite{yousaf2019tracing} looks more generally at these techniques in practice, identifying broader heuristics and patterns.
+
+
+
+\subsection{More on attacks}
+
+\subsubsection{Broad attack strategies, EAE, and traffic analysis}
+
+Generalizing the problem of tracing Monero transactions slightly leads us to an informal description of a security game.
+The EAE game is roughly modeled on a KYC/AML-compliant exchange Eve and a customer Alice.
+Most variations of this attack are captured with the following description, where Alice, Bob, Charlene, Diane, and others transact with Eve, who knows their personal identities as customers.
+\begin{enumerate}
+\item Eve sends at least one these parties some XMR.
+
+\item All parties engage in some arbitrary economic behavior.
+
+\item Eventually, at least one customer sends Eve some XMR.
+\end{enumerate}
+Eve succeeds if she can determine whether the XMR she receives at the end of the game had, in the ground truth chain of custody, the XMR she sent at the beginning of the game.
+That is to say, Eve tries to identify cycles in the chain of custody of funds.
+Cycles of custody like this are inevitable in real-life economies between entities which transact with one another regularly.
+Eve may find herself playing this game incidentally, by merely studying public blockchain data and her own private data.
+Eve may incidentally find herself a very effective player in this game by using data from other public blockchains to inform herself about user behavior.
+Indeed, consider the following thought experiment.
+
+\begin{example}
+Eve may send a transaction $T$ to Alice, say with amount $a$, by spending output $X$, and creating output $Y$.
+She does so by publishing a ring signature and ring consisting of unambiguous references to outputs, and which contains a reference to $X$.
+
+Alice sees $X$ in the ring, but $X$ is only one of several keys in the anonymity set, and Alice cannot be sure which key was actually used by Eve to construct the transaction.
+Alice is certain Eve spent some ring member, but Alice does not know which.
+
+Eve, on the other hand, knows that $Y$ belongs to Alice.
+So, if Alice sends a transaction $T^\prime$ to Eve later, with a lesser amount $a^\prime < a$, and with $Y$ occurring as a ring member (or as a ring member of one of the ring members, or ...), Eve may suspect Alice just sent some of the amount in $Y$ back to Eve, perhaps with some intermediate transactions.
+
+It is possible that Alice was the owner of another ring member $X^\prime$ with an amount at least $a^\prime$, and it is possible that Alice was sloppy by sampling ring members such that $Y$ occurs in the transaction history of $X^\prime$.
+So, Eve can expect a probability of error in this assessment, and Alice has some plausible deniability.
+However, this event has a low likelihood, especially if Alice is using default wallet software which avoids self-sampling.
+
+Thus, it is subjectively more likely that Alice sent back the amount in $Y$.
+Moreover, if some Bob (known by Eve to be distinct from Alice) sends a transaction $T^*$ with output $Z$ to Eve and uses $Y$ as a ring member, Eve can \textit{deterministically} discard $Y$ as a plausible ring member, knowing that $Y$ belongs to Alice.
+Further, if $Y$ occurs as a ring member of a ring member of $Z$, or further back in the transaction history of $Z$, Eve may deduce that Alice and Bob are transacting together.
+\end{example}
+
+We now modify this example to take into account parties other than Alice and Bob, to demonstrate how Alice and Bob's expectations of privacy are connected.
+
+\begin{example}
+If Alice engages in an intermediate transaction before sending back to Eve, the following may be a common occurrence.
+First, Alice spends $Y$ to send two outputs, one with an amount $a^\prime < a$ to Bob with output $Z$, and one with a change amount $a - a^\prime$ back to herself with output $Y^\prime$.
+Second, Alice spends $Y^\prime$ to send an amount $a^{\prime \prime} \leq a - a^\prime$ to Eve with output $Y^*$.
+Meanwhile, Bob is one of Eve's customers and spends $Z$ to send an amount $a^* < a^\prime$ to Eve with output $Z^*$.
+Eve looks at the transaction history of $Y^*$ and $Z^*$, finding that $Y^\prime$ is a ring member for the ring signature authorizing the creation of $Y^*$, and that $Y$ is a ring member for the ring signature authorizing the creation of $Y^\prime$, and $Z$ is a ring member for the ring signature authorizing the creation of $Z^*$.
+Eve knows $a$, $a^*$, and $a^{\prime \prime}$, so she can compute $a - a^{\prime \prime}$ as an upper bound on $a^\prime$.
+Thus, Eve may deduce the sequence of events and bound the transaction amount between Alice and Bob, and even place an upper bound on the amount $a^\prime$ transacted between Alice and Bob.
+In this way, Alice ruined Bob's privacy by immediately sending the XMR she received from Eve to him.
+Bob did nothing but sell something to a third party and deposit his XMR at an exchange.
+Yet, the exchange was able to identify with whom Bob transacted, and for how much.
+
+Eve can even use fees as checksum to verify her suspicions, because the fees corresponding to the fake ring members in the transaction history of $Y^*$ and $Z^*$ are likely to be different than the fees corresponding to the true spenders.
+If the goods Bob sold to Alice included amounts on a public blockchain like Bitcoin, Eve may be able to leverage that information further to learn more about Bob or Alice.
+\end{example}
+
+In both of these examples, Eve can further exploit other analysis methods to profile her customers.
+Meanwhile, everyday consumers like Alice and Bob, who learn quite little about Eve's behavior, suffer a disproportionate privacy disadvantage against Eves who transact with a large portion of the economy and requires AML/KYC authentication.
+
+
+\subsubsection{Spy nodes, evil web wallets, and topology}
+
+Nodes cannot be trusted to respond to queries honestly (corrupted nodes), or to keep their curiosity under control (semi-honest nodes, or spy nodes), leading to a variety of problems.
+
+\cite{lee2018authenticated} presents attacks on Monero traceability based on malicious nodes providing false data to users.
+
+\cite{cao2020exploring} deterministically exposed the Monero network topology, size, connectivity, and so on, using only passive semi-honest nodes.
+Data analysis was informed by deconstructing Monero source code.
+
+\cite{biryukov2019security} investigates wallet- and network-level security properties of various cryptocurrencies, including Monero, and proposes timing-based clustering of transaction outputs.
+They also introduce a clustering heuristic to link transactions when they originate from the same node.
+They implement and test their approach on Bitcoin and Zcash networks, and remark that their approach ought to work with the Monero network, but they do not analyze the Monero network in particular.
+
+They demonstrate clustering heuristics which could be easily deployed by semi-honest wallet service remote nodes, and which correlate transaction outputs originating from a single device (under some reasonable assumptions).
+Their approach both exploits the topology of the cryptocurrency network and the timing behavior of users.
+
+
+\subsubsection{Hardware vulnerabilities}
+
+\cite{klinec2020privacy} describes privacy-preserving hardware wallet implementations for Monero.
+Secure hardware implementations require constant data profiles (timing, memory, and so on).
+The difficulties of hardware implementations are exacerbated in the face of adversaries with extremely powerful microphones \cite{genkin2014rsa}, with high-quality surveillance of electrical load \cite{yen2005power}, or who can inject faults, perhaps with inexpensive and commercially-available laser setups as described in \cite{mathurflipping}.
+Monero is not particularly vulnerable to attacks such as these compared to other cryptocurrencies.
+
+Threat models which account for surveillance at this level of granularity are difficult to reason about.
+For example, protecting oneself against timing attacks requires protecting oneself against adversaries capable of measuring how much time your computer takes to compute with some private data.
+While an adversary with access to this information will generally have available cheaper and/or more effective attacks available, such as the ``four-dollar-wrench'' class of attacks, adversaries who do not wish to reveal to their victim that they have been subject to an attack may find these sidechannels more appealing.
+
+\cite{koerhuis2020forensic} reveals that forensic artifacts are trivially recovered from computers of Monero users, ranging from mnemonic seed phrases to indicators of Monero usage in captured network traffic.
+This data can be leveraged against other users whose hardware has not yet been confiscated, and re-emphasizes the nature of Monero, where your privacy impacts my privacy.
+
+
+\subsection{Formal security frameworks (simulation or otherwise)}
+
+There have existed practical and efficient attacks on Monero untraceability, predating Monero's creation.
+Identifying true/false positives/negatives is not directly possible without de-anonymizing the Monero blockchain, so these attacks are probabalistic, not determinstic.
+Some formal security frameworks have been proposed.
+
+
+\subsubsection{Perfect matchings, Sun Tzu, and traffic analysis}
+
+\cite{cremers2024holistic} presents a restricted security models under which RingCT is provably secure; all of the attacks described here require side-channel information beyond Cremers \textit{et al.}'s security model.
+
+\cite{yu2019re} connects zero-mix-in chain reaction effects and closed set attacks on untraceability with a graph theoretic problem of finding perfect matchings in a bipartite graph, via a novel thought experiment, the ``Sun Tzu Survival Problem.''
+Perfect matchings pair up ring signatures with purported true spenders, and correspond to Monero transaction histories which are \textit{consistent} in the sense that there are no contradictory explanations of the transaction history.
+The approach described in \cite{yu2019re} benefits from using additional information, such as traffic analysis.
+
+Discussed in \cite{goodell2019konferenco}, generating perfect matchings is not a cryptographically difficult problem, despite that the number of perfect matchings (consistent transaction histories) in a Monero transaction history is easily made to be cryptographically large (say, via churn).
+The problem is exacerbated because ``side-channel'' traffic analyses help narrow down likely possibilities with estimates of the likelihood that a given edge in a Monero transaction history is the true-spender's edge.
+
+These descriptions of the problem connect closely to \textit{traffic analysis and disclosure attacks}, which predate \cite{danezis2003statistical} and \cite{agrawal2003measuring}, both in literature and folklore.
+Traffic analysis and disclosure attacks yielded theoretical attacks on Tor in \cite{murdoch2005low}, and well-generalized theoretical attacks in \cite{troncoso2008perfect} and \cite{troncoso2009bayesian}.
+
+\cite{wicht2023transaction} presents graph-theoretic security frameworks in the context of directed acyclic graphs (DAGs) constructed from transaction histories, and compares Monero against Zcash using these.
+Probabilistic extensions of their work also apply, suggesting their techniques are extensible to probabilistic approaches.
+
+
+\subsubsection{Simulation-based approaches}
+
+As for most attacks on untraceability, the attacks in the previous section suffer from a similar problem as previous attacks: we have no easy way of assessing the ground truth of the Monero blockchain to compute a confusion matrix.
+Determining the goodness-of-match requires this confusion matrix.
+
+However, we can use other economies with known ground truths as proxies, or we can simulate a Monero economy to gain access to the ground truth.
+
+Discussed in \cite{borggren2020simulated}, economies of $10$ and $50$ agents were simulated by the researchers to gain control over ground truth data.
+They then were able to featurize Monero transactions under certain weak assumptions about user behavior, so as to deploy machine-learning techniques.
+They applied their attack to real-life Monero data to determine clusters of transactions likely to have been related to the ShapeShift online currency service.
+
+The approach in \cite{borggren2020simulated} is, in a way, a prototype of a simulation-based definition of untraceability for Monero: simulate economic agents who sell goods or services to each other while the attacker observes the blockchain and optionally participates in the economy.
+The transaction protocol would then be secure if there exists a simulator such that every attacker has a negligible advantage at tracing funds.
+
+The approach in \cite{kelen1towards} avoids agent-based simulations, favoring modeling the movement of funds with Markov processes.
+They assign untraceability scores based on Shannon entropy of the probability distribution of absorption probability matrices.
+
+
+\subsubsection{More formal security notions}
+
+Many problems in Monero reduce to related problems in anonymous communication networks (ACNs).
+ACNs have been known at least since \cite{chaum1981untraceable}, and general attacks on ACNs based on traffic analysis and more have been known for much of that history.
+The paper \cite{kuhn2018privacy} summarizes and systematizes some of these as they apply to cryptocurrencies, but the history on anonymous communication networks is mountainous.
+
+
+\subsection{Metanalyses, SOKs, surveys, and summaries}
+
+\cite{alsalami2019sok} is an SOK describing privacy in cryptocurrency at the time of publication.
+\cite{khan2019look} is a high-level look at the properties of multiple currencies, including Monero, but does not describe any particular attacks.
+
+\cite{junejo2020survey} presents a survey of common attacks on privacy in permissionless cryptocurrencies.
+While a useful resource for the time, this high-level survey uncritically repeats claims of de-anonymization statistics which are not necessarily supported by the literature.
+As such, \cite{junejo2020survey} is perhaps more appropriately described as a survey of \textit{claims}, not necessarily results.
+
+\cite{andola2021anonymity} surveys anonymity technology in cryptocurrencies, discusses possibly definitions relating to anonymity, and makes recommendations for future design principles for anonymous e-cash.
+
+\cite{deuber2022sok} is an SOK revealing the assumptions underlying various cryptocurrency de-anonymizations, developing a taxonomy of de-anonymization assumptions, and describing their practical relevance in different blockchains.
+
+
+\subsection{Economics, sociology, psychology, and law}
+
+\cite{deuber2024argumentation} suggests an argumentation framework for use in legal contexts to resolve (some of) the ``false positive'' problem implicit in de-anonymization techniques for small-anonymity set currencies.
+However, this paper does not present novel attacks.
+
+\cite{wallbach2020trust} shows that immutability and traceability improve trust in finance technology but anonymity both degrades trust and makes trust more sensitive to immutability.
+
+\cite{purkovic2021empirical} assesses the economic consequences in case that the Monero mining algorithm were to be effectively but secretly built into application-specific integrated circuits (ASICs) by a single (possibly malicious) party.
+
+
+\section{Assessment and discussion}
+
+
+\subsection{Assessment}
+
+Table \ref{tab:assessment} provides an extremely generalized assessment of estimated impacts of various methods of analysis and attack against transaction protocols with small anonymity sets.
+The table is necessarily non-comprehensive, but touches on most of the most relevant security issues.
+For each, the table examines the impacts for the current Monero protocol, as well as for a hypothetical future protocol using FCMPs.
+
+Most of the listed techniques are analysis methods against various types of user-initiated behavior.
+For these, the table lists whether or not the protocol is safe against the technique for the user (``self''), as well as whether or not the technique is safe for other users given the behavior (``others'').
+This helps to determine what user behavior can lead to reduced security for other users, and what behavior might be limited to reduced security only for the initiator.
+
+Two of the techniques represent attacks that are not user initiated.
+For these, no differentiation between ``self'' and ``others'' is required.
+
+\begin{table}[h]
+\begin{tabular}{|l|cc|cc|}
+\hline
+& \multicolumn{2}{|c|}{Current protocol} & \multicolumn{2}{|c|}{FCMP protocol} \\
+\hline
+Method & Self & Others & Self & Others \\
+\hline
+Chain reaction & \cmark & \cmark & \cmark & \cmark \\
+Closed sets & \cmark & \cmark & \cmark & \cmark \\
+Output merging & \hmark & \cmark & \cmark & \cmark \\
+Poison/flood & \multicolumn{2}{|c|}{\xmark} & \multicolumn{2}{|c|}{\cmark} \\
+Amount/fee linking & \xmark & \cmark & \xmark & \cmark \\
+Churn & \hmark & \cmark & \cmark & \cmark \\
+EAE & \hmark & \cmark & \cmark & \cmark \\
+Cross-chain tracing & \xmark & \hmark & \hmark & \cmark \\
+Temporal ring distribution & \cmark & \cmark & \cmark & \cmark \\
+Bad randomness & \cmark & \cmark & \cmark & \cmark \\
+Hardware attacks & \multicolumn{2}{|c|}{\hmark} & \multicolumn{2}{|c|}{\hmark} \\
+Payment IDs & \cmark & \cmark & \cmark & \cmark \\
+Mining data & \hmark & \xmark & \hmark & \cmark \\
+Network propagation & \hmark & \cmark & \hmark & \cmark \\
+Forced faults & \hmark & \cmark & \hmark & \cmark \\
+\hline
+\end{tabular}
+\caption{General assessment of safety of protocols against adversarial analyses and attacks. (\cmark: the protocol is safe in practice; \hmark: the protocol may be vulnerable in practice; \xmark: the protocol is vulnerable)}
+\label{tab:assessment}
+\end{table}
+
+Notably, each assessment assumes the use of the default Monero client software whenever reasonable; this does not necessarily apply to the case of hardware attacks, where a variety of client hardware devices and software may be used depending on the endpoint.
+
+There are subtleties to these assessments:
+\begin{itemize}
+\item \textbf{Poison/flood}. Such attacks are highly dependent on duration, and further impacted by ring sampling.
+\item \textbf{Churn}. The nature of churn techniques is understudied due to the varied and complex approaches that a user might take, and further extremely difficult to assess due to relatively unknown adversarial heuristics and thresholds.
+\item \textbf{Hardware attacks}. Hardware attacks are likely to be targeted.
+\item \textbf{Network propagation}. Existing research indicates that current mitigations against network-based transaction propagation analysis are reasonable, but depend highly on the heuristics applied by an adversary.
+\end{itemize}
+
+
+\subsection{Attack efficacy}
+
+We mention \textit{confusion matrices} above.
+Without being able to fully determine a confusion matrix, the goodness of a statistical test is difficult to determine.
+We elaborate on this.
+
+Confusion matrices contain all information related to true positives, false positives, true negatives, and false negatives.
+With only partial information, a full confusion matrix cannot be computed.
+However, certain statistics like accuracy can be computed if certain ground truth data is obtained, such as from a deterministic attack or analysis.
+
+Unfortunately, without a full confusion matrix, accuracy alone provides a misleading sense of the goodness of a test.
+Consider a blood test with $99\%$ accuracy for a rare disease carried by $1$ in $10,000$ individuals.
+Among $10,000$ people, $9,999$ are healthy, so we expect $100 \approx (1-0.99) \cdot 9999$ false positives and $1 \approx 0.99 \cdot 1$ true positive.
+For this test, $99\%$ of the people who are tested as positive are actually healthy.
+This is known as the false positive paradox, and explains why accuracy is not enough to determine if a test is useful and, in turn, why the full confusion matrix is necessary to determine the goodness of a test.
+
+Some references estimate the missing confusion matrix data, whether with data obtained from an attack, by proxy by studying the Bitcoin blockchain, by proxy using simulated economies, or otherwise.
+An attacker benchmarking their performance against these estimates are vulnerable to gaps between the proxy data and reality, perhaps unjustifiably convincing themselves of their own efficacy at tracing transactions.
+Yet, these methods and techniques still present a serious security problem.
+In fact, an attacker can use these estimates to improve their tests, update Bayesian prior assumptions about user profiles, leverage machine learning, dynamically adjust their strategies, and more.
+If full-chain membership proofs replace ring signatures in future updates to the Monero protocol, attackers will lose the benefit of these estimated benchmarks.
+
+
+\subsection{Future work}\label{sec:future}
+
+As noted elsewhere, certain practices remain ambiguous or understudied, in particular because they represent more complex behavior that can interact with multiple heuristics, and for which it is not clear how an adversary may make its assessments.
+These are areas well suited for future work.
+
+Most prevalent is the practice of churning.
+Churning refers to a general approach of executing self-spend transactions to expand the graph surrounding particular economic behavior.
+This approach may necessarily interact with other attacks or methods of analysis: floods, temporal ring distributions, and output merging may easily come into play.
+The benefits and specific risks of churning are understudied, as many such methods may be identifiable, and an adversary might use a variety of heuristics to flag the behavior.
+
+Relating to this, the EAE game is understudied.
+As noted earlier, this generally captures round-trip economic behavior, where an adversary interacts multiple times with a user in transactions, and attempts to gain information about related transaction behavior.
+Heuristics and statistics relating to such analysis depend highly on user behavior, as well as the nature of the interaction between adversarial entities.
+
+Specific instances of mitigations surrounding churn and EAE behavior may involve attempting to thwart specific related heuristics that an adversary might use to identify this behavior and overcome it.
+This is challenging to analyze: common heuristics frequently overlap or play off each other, and an adversary may have additional external information or metadata to use to its advantage.
+This slipperiness of heuristic-based security is the origin of formal security notions in cryptography and \textit{universal composability}, highlighting the problems associated with using a tool without a formal security model for that tool.
+
+Fortunately, we observe that many attacks and forms of analysis are properly mitigated or rendered ineffective by full-chain membership proofs.
+The limited structure of ring signatures proves easily to be the source of many effective adversarial techniques, so implementation of these proofs in a future protocol upgrade may be considered a particularly effective step.
+
+
+\nocite{*}
+\bibliographystyle{plain}
+\bibliography{main}
+
+\end{document}
